@@ -1,4 +1,5 @@
 import mysql, { Pool, PoolOptions, RowDataPacket, ResultSetHeader } from 'mysql2/promise'
+import { mysql as sql } from 'yesql'
 import { EntitySchema } from '../schemas/types'
 
 type MySQLConfig = {
@@ -20,23 +21,23 @@ export class MySQLClient {
     this.pool = mysql.createPool({
       ...config.poolConfig,
       database: config.schema,
-      namedPlaceholders: true, // Enable named placeholders like :id, :name
+      // yesql converts named placeholders to positional ? placeholders
     })
   }
 
   async delete(table: string, id: string): Promise<boolean> {
     // MySQL doesn't support RETURNING clause, so we check affectedRows
-    const sql = `
+    const prepared = sql(`
       DELETE FROM \`${this.config.schema}\`.\`${table}\`
       WHERE id = :id
-    `
+    `)({ id })
 
-    const [result] = await this.pool.execute<ResultSetHeader>(sql, { id })
+    const [result] = await this.pool.execute<ResultSetHeader>(prepared.sql, prepared.values)
     return result.affectedRows > 0
   }
 
-  async query(text: string, params?: any): Promise<QueryResult> {
-    const [rows] = await this.pool.execute<RowDataPacket[]>(text, params)
+  async query(sqlText: string, params?: any): Promise<QueryResult> {
+    const [rows] = await this.pool.execute<RowDataPacket[]>(sqlText, params)
     return {
       rows: rows as any[],
       rowCount: rows.length,
@@ -63,7 +64,11 @@ export class MySQLClient {
         const cleansed = this.cleanseArrayField(entry)
         const upsertSql = this.constructUpsertSql(this.config.schema, table, tableSchema)
 
-        queries.push(this.executeUpsert(upsertSql, cleansed, table))
+        const prepared = sql(upsertSql, {
+          useNullForMissing: true,
+        })(cleansed)
+
+        queries.push(this.executeUpsert(prepared.sql, prepared.values, cleansed))
       })
 
       results.push(...(await Promise.all(queries)))
@@ -101,7 +106,11 @@ export class MySQLClient {
           tableSchema
         )
 
-        queries.push(this.executeUpsert(upsertSql, cleansed, table))
+        const prepared = sql(upsertSql, {
+          useNullForMissing: true,
+        })(cleansed)
+
+        queries.push(this.executeUpsert(prepared.sql, prepared.values, cleansed))
       })
 
       results.push(...(await Promise.all(queries)))
@@ -114,12 +123,12 @@ export class MySQLClient {
     if (!ids.length) return []
 
     // MySQL uses IN clause instead of PostgreSQL's ANY
-    const sql = `
+    const prepared = sql(`
       SELECT id FROM \`${this.config.schema}\`.\`${table}\`
       WHERE id IN (:ids)
-    `
+    `)({ ids })
 
-    const { rows } = await this.query(sql, { ids })
+    const { rows } = await this.query(prepared.sql, prepared.values)
     const existingIds = rows.map((it) => it.id)
 
     const missingIds = ids.filter((it) => !existingIds.includes(it))
@@ -134,12 +143,12 @@ export class MySQLClient {
    * For simplicity and performance, we return the input data after successful upsert.
    * The alternative would be to SELECT after every INSERT/UPDATE, which is expensive.
    */
-  private async executeUpsert<T>(sql: string, params: any, table: string): Promise<T[]> {
-    await this.pool.execute<ResultSetHeader>(sql, params)
+  private async executeUpsert<T>(sqlText: string, values: any[], originalData: T): Promise<T[]> {
+    await this.pool.execute<ResultSetHeader>(sqlText, values)
 
     // Return the input data wrapped in array
     // The upsert succeeded, so the data in the DB matches what we sent
-    return [params as T]
+    return [originalData]
   }
 
   /**
